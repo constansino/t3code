@@ -104,6 +104,7 @@ function raceWithTimeout<T>(
     const timeout = setTimeout(() => {
       reject(new Error(timeoutMessage));
     }, timeoutMs);
+    timeout.unref();
 
     promise.then(
       (value) => {
