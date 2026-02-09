@@ -83,4 +83,4 @@ The renderer depends on `nativeApi.providers.*`:
 6. `listSessions`
 7. `onEvent`
 
-Codex is the only implemented provider right now. `claudeCode` is reserved in contracts/UI but returns a not-implemented error in main-process dispatch.
+Codex is the only implemented provider right now. `claudeCode` is reserved in contracts/UI but currently returns a not-implemented runtime error.
