@@ -70,6 +70,10 @@ const agentWriteInputSchema = z.object({
   sessionId: z.string().min(1),
   data: z.string(),
 });
+const shellOpenInEditorInputSchema = z.object({
+  cwd: z.string().min(1),
+  editor: z.enum(EDITORS.map((entry) => entry.id) as [string, ...string[]]),
+});
 
 interface RuntimeApiServerOptions {
   port: number;
@@ -524,11 +528,7 @@ export async function startRuntimeApiServer(
     if (method === "providers.listSessions") return providerManager.listSessions();
 
     if (method === "shell.openInEditor") {
-      const schema = z.object({
-        cwd: z.string().min(1),
-        editor: z.enum(EDITORS.map((entry) => entry.id) as [string, ...string[]]),
-      });
-      const parsed = schema.parse(params);
+      const parsed = shellOpenInEditorInputSchema.parse(params);
       const editor = EDITORS.find((entry) => entry.id === parsed.editor);
       if (!editor) {
         throw new Error(`Unknown editor: ${parsed.editor}`);
