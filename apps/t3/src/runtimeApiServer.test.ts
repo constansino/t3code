@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createServer as createNetServer } from "node:net";
@@ -145,6 +145,80 @@ const METHOD_COVERAGE_PARAMS: Record<WsNativeApiMethod, unknown> = {
     editor: "file-manager",
   },
 };
+
+function createFakeCodexAppServerBinary() {
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "codex-app-server-fake-"));
+  const binaryPath = path.join(tempDir, "codex");
+  const script = `#!/usr/bin/env node
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+let turnCount = 0;
+const send = (message) => process.stdout.write(\`\${JSON.stringify(message)}\\n\`);
+
+rl.on("line", (line) => {
+  let parsed;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return;
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    return;
+  }
+
+  if (!("id" in parsed) || typeof parsed.method !== "string") {
+    return;
+  }
+
+  if (parsed.method === "initialize") {
+    send({ id: parsed.id, result: {} });
+    return;
+  }
+
+  if (parsed.method === "thread/start") {
+    send({ id: parsed.id, result: { thread: { id: "thread-fake" } } });
+    return;
+  }
+
+  if (parsed.method === "thread/resume") {
+    const threadId =
+      parsed.params &&
+      typeof parsed.params === "object" &&
+      typeof parsed.params.threadId === "string"
+        ? parsed.params.threadId
+        : "thread-fake";
+    send({ id: parsed.id, result: { thread: { id: threadId } } });
+    return;
+  }
+
+  if (parsed.method === "turn/start") {
+    turnCount += 1;
+    send({ id: parsed.id, result: { turn: { id: \`turn-\${turnCount}\` } } });
+    return;
+  }
+
+  if (parsed.method === "turn/interrupt") {
+    send({ id: parsed.id, result: {} });
+    return;
+  }
+
+  send({
+    id: parsed.id,
+    error: {
+      code: -32601,
+      message: \`Unsupported fake codex method: \${parsed.method}\`,
+    },
+  });
+});
+`;
+  writeFileSync(binaryPath, script, { encoding: "utf8", mode: 0o755 });
+
+  return {
+    tempDir,
+    binaryPath,
+  };
+}
 
 async function waitForAgentEvent(
   nextMessage: () => Promise<WsServerMessage>,
@@ -662,6 +736,130 @@ describe("runtimeApiServer", () => {
     expect(Array.isArray(response.result)).toBe(true);
 
     client.socket.close();
+  });
+
+  it("supports provider lifecycle methods with a fake codex app-server", async () => {
+    const fakeCodex = createFakeCodexAppServerBinary();
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${fakeCodex.tempDir}${path.delimiter}${originalPath ?? ""}`;
+
+    try {
+      const server = await startRuntimeApiServer({
+        port: 0,
+        launchCwd: process.cwd(),
+      });
+      servers.push(server);
+
+      const client = await connectClient(server.wsUrl);
+      await client.nextMessage();
+
+      const startResponse = await sendRequest(
+        client.socket,
+        client.nextMessage,
+        "providers-start-fake-1",
+        "providers.startSession",
+        {
+          provider: "codex",
+        },
+      );
+      expect(startResponse.ok).toBe(true);
+      if (!startResponse.ok) {
+        throw new Error("Expected fake providers.startSession response to succeed.");
+      }
+
+      const session = startResponse.result as {
+        sessionId: string;
+        provider: string;
+        status: string;
+        threadId?: string;
+      };
+      expect(session.provider).toBe("codex");
+      expect(session.status).toBe("ready");
+      expect(session.threadId).toBe("thread-fake");
+      expect(session.sessionId.length).toBeGreaterThan(0);
+
+      const sendTurnResponse = await sendRequest(
+        client.socket,
+        client.nextMessage,
+        "providers-turn-fake-1",
+        "providers.sendTurn",
+        {
+          sessionId: session.sessionId,
+          input: "hello fake codex",
+        },
+      );
+      expect(sendTurnResponse.ok).toBe(true);
+      if (!sendTurnResponse.ok) {
+        throw new Error("Expected fake providers.sendTurn response to succeed.");
+      }
+      const turnResult = sendTurnResponse.result as {
+        threadId: string;
+        turnId: string;
+      };
+      expect(turnResult.threadId).toBe("thread-fake");
+      expect(turnResult.turnId).toBe("turn-1");
+
+      const interruptResponse = await sendRequest(
+        client.socket,
+        client.nextMessage,
+        "providers-interrupt-fake-1",
+        "providers.interruptTurn",
+        {
+          sessionId: session.sessionId,
+        },
+      );
+      expect(interruptResponse.ok).toBe(true);
+      if (!interruptResponse.ok) {
+        throw new Error("Expected fake providers.interruptTurn response to succeed.");
+      }
+      expect(interruptResponse.result).toBeNull();
+
+      const beforeStopListResponse = await sendRequest(
+        client.socket,
+        client.nextMessage,
+        "providers-list-before-stop-fake-1",
+        "providers.listSessions",
+      );
+      expect(beforeStopListResponse.ok).toBe(true);
+      if (!beforeStopListResponse.ok) {
+        throw new Error("Expected pre-stop providers.listSessions response to succeed.");
+      }
+      const sessionsBeforeStop = beforeStopListResponse.result as Array<{ sessionId: string }>;
+      expect(sessionsBeforeStop.some((entry) => entry.sessionId === session.sessionId)).toBe(true);
+
+      const stopResponse = await sendRequest(
+        client.socket,
+        client.nextMessage,
+        "providers-stop-fake-1",
+        "providers.stopSession",
+        {
+          sessionId: session.sessionId,
+        },
+      );
+      expect(stopResponse.ok).toBe(true);
+      if (!stopResponse.ok) {
+        throw new Error("Expected fake providers.stopSession response to succeed.");
+      }
+      expect(stopResponse.result).toBeNull();
+
+      const afterStopListResponse = await sendRequest(
+        client.socket,
+        client.nextMessage,
+        "providers-list-after-stop-fake-1",
+        "providers.listSessions",
+      );
+      expect(afterStopListResponse.ok).toBe(true);
+      if (!afterStopListResponse.ok) {
+        throw new Error("Expected post-stop providers.listSessions response to succeed.");
+      }
+      const sessionsAfterStop = afterStopListResponse.result as Array<{ sessionId: string }>;
+      expect(sessionsAfterStop.some((entry) => entry.sessionId === session.sessionId)).toBe(false);
+
+      client.socket.close();
+    } finally {
+      process.env.PATH = originalPath;
+      rmSync(fakeCodex.tempDir, { recursive: true, force: true });
+    }
   });
 
   it("handles shell.openInEditor file-manager requests", async () => {
