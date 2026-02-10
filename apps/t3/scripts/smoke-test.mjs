@@ -165,6 +165,9 @@ async function main() {
     if (page.status !== 200) {
       throw new Error(`Smoke test failed: expected web status 200, received ${page.status}.`);
     }
+    if (page.headers.get("x-content-type-options") !== "nosniff") {
+      throw new Error("Smoke test failed: expected x-content-type-options=nosniff.");
+    }
 
     const wsUrl = parsedAppUrl.searchParams.get("ws");
     if (!wsUrl) {

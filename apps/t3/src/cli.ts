@@ -552,6 +552,7 @@ function startStaticWebServer(distRoot: string, port: number) {
 
       response.statusCode = 200;
       response.setHeader("Content-Type", contentTypeFor(targetPath));
+      response.setHeader("X-Content-Type-Options", "nosniff");
       response.end(content);
     });
   });
