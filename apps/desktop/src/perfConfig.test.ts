@@ -293,3 +293,47 @@ describe("shouldRunBenchmarkThreadSweep", () => {
     ).toBe(true);
   });
 });
+
+describe("toggle fallback consistency", () => {
+  it("applies the same CI-aware fallback to all perf toggles", () => {
+    const unknownValue = { value: "maybe" };
+
+    expect(
+      shouldRunTerminalPerfInteractions({
+        T3CODE_DESKTOP_PERF_RUN_TERMINAL: unknownValue.value,
+        CI: "true",
+      }),
+    ).toBe(false);
+    expect(
+      shouldRunOptionalRendererPerfInteractions({
+        T3CODE_DESKTOP_PERF_RUN_OPTIONAL_RENDERER: unknownValue.value,
+        CI: "true",
+      }),
+    ).toBe(false);
+    expect(
+      shouldRunBenchmarkThreadSweep({
+        T3CODE_DESKTOP_PERF_RUN_BENCHMARK_SWEEP: unknownValue.value,
+        CI: "true",
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldRunTerminalPerfInteractions({
+        T3CODE_DESKTOP_PERF_RUN_TERMINAL: unknownValue.value,
+        CI: "false",
+      }),
+    ).toBe(true);
+    expect(
+      shouldRunOptionalRendererPerfInteractions({
+        T3CODE_DESKTOP_PERF_RUN_OPTIONAL_RENDERER: unknownValue.value,
+        CI: "false",
+      }),
+    ).toBe(true);
+    expect(
+      shouldRunBenchmarkThreadSweep({
+        T3CODE_DESKTOP_PERF_RUN_BENCHMARK_SWEEP: unknownValue.value,
+        CI: "false",
+      }),
+    ).toBe(true);
+  });
+});
