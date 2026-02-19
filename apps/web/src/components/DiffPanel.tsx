@@ -241,29 +241,8 @@ export default function DiffPanel({ mode = "inline" }: DiffPanelProps) {
     }
 
     // Fallback when a conversation checkpoint diff isn't available yet:
-    // keep one patch per file path (latest change wins) so files aren't duplicated.
-    const latestPatchByPath = new Map<string, string>();
-    for (const summary of turnDiffSummaries) {
-      for (const file of summary.files) {
-        if (latestPatchByPath.has(file.path)) {
-          continue;
-        }
-        const patch = file.diff?.trim();
-        if (!patch) {
-          continue;
-        }
-        latestPatchByPath.set(file.path, patch);
-      }
-    }
-    if (latestPatchByPath.size > 0) {
-      return Array.from(latestPatchByPath.entries())
-        .toSorted(([leftPath], [rightPath]) =>
-          leftPath.localeCompare(rightPath, undefined, { numeric: true, sensitivity: "base" }),
-        )
-        .map(([, patch]) => patch)
-        .join("\n\n");
-    }
-
+    // show each turn's diff (oldest first) via patchForSummary, which prefers
+    // cached checkpoint diffs when available.
     const patches = turnDiffSummaries
       .toReversed()
       .map((summary) => patchForSummary(summary)?.trim())

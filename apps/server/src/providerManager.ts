@@ -320,7 +320,7 @@ export class ProviderManager extends EventEmitter<ProviderManagerEvents> {
         );
       }
 
-      if (checkpointCwd && input.turnCount > 0) {
+      if (input.turnCount > 0) {
         const hasCheckpoint = await this.filesystemCheckpointStore.hasCheckpoint({
           cwd: checkpointCwd,
           threadId: beforeSnapshot.threadId,
