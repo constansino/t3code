@@ -176,6 +176,38 @@ describe("commandInvariants", () => {
         }),
       ),
     ).rejects.toThrow("already exists");
+
+    await Effect.runPromise(
+      requireThreadAbsent({
+        readModel: (() => {
+          const deletedThreads = [...readModel.threads];
+          const deletedThreadIndex = deletedThreads.findIndex(
+            (thread) => thread.id === ThreadId.makeUnsafe("thread-1"),
+          );
+          if (deletedThreadIndex >= 0) {
+            deletedThreads[deletedThreadIndex] = Object.assign({}, deletedThreads[deletedThreadIndex], {
+              deletedAt: now,
+              updatedAt: now,
+            });
+          }
+          return Object.assign({}, readModel, { threads: deletedThreads });
+        })(),
+        command: {
+          type: "thread.create",
+          commandId: CommandId.makeUnsafe("cmd-4"),
+          threadId: ThreadId.makeUnsafe("thread-1"),
+          projectId: ProjectId.makeUnsafe("project-a"),
+          title: "rebuilt",
+          model: "gpt-5-codex",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          createdAt: now,
+        },
+        threadId: ThreadId.makeUnsafe("thread-1"),
+      }),
+    );
   });
 
   it("requires non-negative integers", async () => {

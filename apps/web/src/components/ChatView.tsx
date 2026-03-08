@@ -5,6 +5,7 @@ import {
   type EditorId,
   type KeybindingCommand,
   type CodexReasoningEffort,
+  type CodexSourceConfig,
   type MessageId,
   type ProjectId,
   type ProjectEntry,
@@ -199,9 +200,15 @@ import { SidebarTrigger } from "./ui/sidebar";
 import { newCommandId, newMessageId, newThreadId } from "~/lib/utils";
 import { readNativeApi } from "~/nativeApi";
 import {
+  bindThreadCodexSourceIds,
   getAppModelOptions,
   resolveAppModelSelection,
   resolveAppServiceTier,
+  resolveConfiguredCodexSources,
+  resolveCodexProviderOptionsForSource,
+  resolveCodexSourceById,
+  resolveProjectCodexSourceId,
+  resolveThreadCodexSourceId,
   shouldShowFastTierIcon,
   type AppServiceTier,
   useAppSettings,
@@ -596,7 +603,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const syncServerReadModel = useStore((store) => store.syncServerReadModel);
   const setStoreThreadError = useStore((store) => store.setError);
   const setStoreThreadBranch = useStore((store) => store.setThreadBranch);
-  const { settings } = useAppSettings();
+  const { settings, updateSettings } = useAppSettings();
   const navigate = useNavigate();
   const rawSearch = useSearch({
     strict: false,
@@ -799,6 +806,32 @@ export default function ChatView({ threadId }: ChatViewProps) {
     ? (sessionProvider ?? selectedProviderByThreadId ?? null)
     : null;
   const selectedProvider: ProviderKind = lockedProvider ?? selectedProviderByThreadId ?? "codex";
+  const configuredCodexSources = useMemo(() => resolveConfiguredCodexSources(settings), [settings]);
+  const projectCodexSourceId = useMemo(
+    () => resolveProjectCodexSourceId(settings, activeThread?.projectId),
+    [activeThread?.projectId, settings],
+  );
+  const selectedCodexSourceId = useMemo(
+    () => resolveThreadCodexSourceId(settings, activeThreadId ?? threadId, activeThread?.projectId),
+    [activeThread?.projectId, activeThreadId, settings, threadId],
+  );
+  const hasExplicitCodexSourceBinding = Boolean(
+    settings.threadCodexSourceBindings[activeThreadId ?? threadId],
+  );
+  const lockedCodexSourceId =
+    projectCodexSourceId ??
+    (hasThreadStarted && hasExplicitCodexSourceBinding ? selectedCodexSourceId : null);
+  const selectedCodexSource = useMemo(
+    () => resolveCodexSourceById(settings, selectedCodexSourceId),
+    [selectedCodexSourceId, settings],
+  );
+  const selectedCodexProviderOptions = useMemo(
+    () =>
+      selectedProvider === "codex"
+        ? resolveCodexProviderOptionsForSource(settings, selectedCodexSource)
+        : undefined,
+    [selectedCodexSource, selectedProvider, settings],
+  );
   const baseThreadModel = resolveModelSlugForProvider(
     selectedProvider,
     activeThread?.model ?? activeProject?.model ?? getDefaultModel(selectedProvider),
@@ -857,6 +890,21 @@ export default function ChatView({ threadId }: ChatViewProps) {
         })),
       ),
     [lockedProvider, modelOptionsByProvider],
+  );
+  const persistSelectedCodexSourceBinding = useCallback(
+    (targetThreadIds: readonly ThreadId[]) => {
+      if (selectedProvider !== "codex" || !selectedCodexSource) {
+        return;
+      }
+      updateSettings({
+        threadCodexSourceBindings: bindThreadCodexSourceIds(
+          settings,
+          targetThreadIds,
+          selectedCodexSource.id,
+        ),
+      });
+    },
+    [selectedCodexSource, selectedProvider, settings, updateSettings],
   );
   const phase = derivePhase(activeThread?.session ?? null);
   const isSendBusy = sendPhase !== "idle";
@@ -2626,6 +2674,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
         ...(selectedModelOptionsForDispatch
           ? { modelOptions: selectedModelOptionsForDispatch }
           : {}),
+        ...(selectedCodexProviderOptions ? { providerOptions: selectedCodexProviderOptions } : {}),
         provider: selectedProvider,
         assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
         runtimeMode,
@@ -2633,6 +2682,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
         createdAt: messageCreatedAt,
       });
       turnStartSucceeded = true;
+      persistSelectedCodexSourceBinding([threadIdForSend]);
       if (isFirstMessage) {
         clearDraftThread(threadIdForSend);
       }
@@ -2903,11 +2953,13 @@ export default function ChatView({ threadId }: ChatViewProps) {
           ...(selectedModelOptionsForDispatch
             ? { modelOptions: selectedModelOptionsForDispatch }
             : {}),
+          ...(selectedCodexProviderOptions ? { providerOptions: selectedCodexProviderOptions } : {}),
           assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
           runtimeMode,
           interactionMode: nextInteractionMode,
           createdAt: messageCreatedAt,
         });
+        persistSelectedCodexSourceBinding([threadIdForSend]);
         sendInFlightRef.current = false;
       } catch (err) {
         setOptimisticUserMessages((existing) =>
@@ -2928,9 +2980,11 @@ export default function ChatView({ threadId }: ChatViewProps) {
       isConnecting,
       isSendBusy,
       isServerThread,
+      persistSelectedCodexSourceBinding,
       persistThreadSettingsForNextTurn,
       resetSendPhase,
       runtimeMode,
+      selectedCodexProviderOptions,
       selectedModel,
       selectedModelOptionsForDispatch,
       selectedProvider,
@@ -3003,13 +3057,17 @@ export default function ChatView({ threadId }: ChatViewProps) {
           ...(selectedModelOptionsForDispatch
             ? { modelOptions: selectedModelOptionsForDispatch }
             : {}),
+          ...(selectedCodexProviderOptions ? { providerOptions: selectedCodexProviderOptions } : {}),
           assistantDeliveryMode: settings.enableAssistantStreaming ? "streaming" : "buffered",
           runtimeMode,
           interactionMode: "default",
           createdAt,
         }),
       )
-      .then(() => api.orchestration.getSnapshot())
+      .then(() => {
+        persistSelectedCodexSourceBinding([nextThreadId]);
+        return api.orchestration.getSnapshot();
+      })
       .then((snapshot) => {
         syncServerReadModel(snapshot);
         return navigate({
@@ -3048,8 +3106,10 @@ export default function ChatView({ threadId }: ChatViewProps) {
     isSendBusy,
     isServerThread,
     navigate,
+    persistSelectedCodexSourceBinding,
     resetSendPhase,
     runtimeMode,
+    selectedCodexProviderOptions,
     selectedModel,
     selectedModelOptionsForDispatch,
     selectedProvider,
@@ -3079,6 +3139,28 @@ export default function ChatView({ threadId }: ChatViewProps) {
       setComposerDraftProvider,
       settings.customCodexModels,
     ],
+  );
+  const onCodexSourceSelect = useCallback(
+    (sourceId: string) => {
+      const resolvedSource = resolveCodexSourceById(settings, sourceId);
+      if (!resolvedSource) {
+        scheduleComposerFocus();
+        return;
+      }
+      if (lockedCodexSourceId !== null && resolvedSource.id !== lockedCodexSourceId) {
+        scheduleComposerFocus();
+        return;
+      }
+      updateSettings({
+        threadCodexSourceBindings: bindThreadCodexSourceIds(
+          settings,
+          [activeThreadId ?? threadId],
+          resolvedSource.id,
+        ),
+      });
+      scheduleComposerFocus();
+    },
+    [activeThreadId, lockedCodexSourceId, scheduleComposerFocus, settings, threadId, updateSettings],
   );
   const onEffortSelect = useCallback(
     (effort: CodexReasoningEffort) => {
@@ -3632,6 +3714,18 @@ export default function ChatView({ threadId }: ChatViewProps) {
                     serviceTierSetting={selectedServiceTierSetting}
                     onProviderModelChange={onProviderModelSelect}
                   />
+
+                  {selectedProvider === "codex" ? (
+                    <>
+                      <Separator orientation="vertical" className="mx-0.5 hidden h-4 sm:block" />
+                      <CodexSourcePicker
+                        sourceId={selectedCodexSource?.id ?? selectedCodexSourceId}
+                        lockedSourceId={lockedCodexSourceId}
+                        sources={configuredCodexSources}
+                        onSourceChange={onCodexSourceSelect}
+                      />
+                    </>
+                  ) : null}
 
                   {selectedProvider === "codex" && selectedEffort != null ? (
                     <>
@@ -5470,6 +5564,92 @@ const ProviderModelPicker = memo(function ProviderModelPicker(props: {
             </MenuItem>
           );
         })}
+      </MenuPopup>
+    </Menu>
+  );
+});
+
+const CODEX_SOURCE_KIND_LABEL: Record<CodexSourceConfig["kind"], string> = {
+  local: "Local",
+  remoteWs: "Remote WS",
+  remoteSsh: "Remote SSH",
+};
+
+const CodexSourcePicker = memo(function CodexSourcePicker(props: {
+  sourceId: string;
+  lockedSourceId: string | null;
+  sources: ReadonlyArray<CodexSourceConfig>;
+  disabled?: boolean;
+  onSourceChange: (sourceId: string) => void;
+}) {
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const selectedSource = props.sources.find((source) => source.id === props.sourceId) ?? props.sources[0];
+
+  if (!selectedSource) {
+    return null;
+  }
+
+  return (
+    <Menu
+      open={isMenuOpen}
+      onOpenChange={(open) => {
+        if (props.disabled) {
+          setIsMenuOpen(false);
+          return;
+        }
+        setIsMenuOpen(open);
+      }}
+    >
+      <MenuTrigger
+        render={
+          <Button
+            size="sm"
+            variant="ghost"
+            className="shrink-0 whitespace-nowrap px-2 text-muted-foreground/70 hover:text-foreground/80 sm:px-3"
+            disabled={props.disabled}
+          />
+        }
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="truncate">{selectedSource.name}</span>
+          <ChevronDownIcon aria-hidden="true" className="size-3 opacity-60" />
+        </span>
+      </MenuTrigger>
+      <MenuPopup align="start">
+        <MenuGroup>
+          <MenuRadioGroup
+            value={selectedSource.id}
+            onValueChange={(value) => {
+              if (props.disabled) return;
+              if (!value) return;
+              if (props.lockedSourceId !== null && props.lockedSourceId !== value) return;
+              props.onSourceChange(value);
+              setIsMenuOpen(false);
+            }}
+          >
+            {props.sources.map((source) => {
+              const isDisabledByLock =
+                props.lockedSourceId !== null && props.lockedSourceId !== source.id;
+              return (
+                <MenuRadioItem
+                  key={source.id}
+                  value={source.id}
+                  disabled={isDisabledByLock}
+                  onClick={() => {
+                    if (!isDisabledByLock) {
+                      setIsMenuOpen(false);
+                    }
+                  }}
+                >
+                  <span className="truncate">{source.name}</span>
+                  <span className="ms-auto text-[11px] text-muted-foreground/80 uppercase tracking-[0.08em]">
+                    {CODEX_SOURCE_KIND_LABEL[source.kind]}
+                  </span>
+                </MenuRadioItem>
+              );
+            })}
+          </MenuRadioGroup>
+        </MenuGroup>
       </MenuPopup>
     </Menu>
   );

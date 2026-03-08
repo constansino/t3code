@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { Effect, Exit, Layer, PlatformError, PubSub, Scope, Stream } from "effect";
+import { Effect, Exit, Layer, Option, PlatformError, PubSub, Scope, Stream } from "effect";
 import { describe, expect, it, afterEach, vi } from "vitest";
 import { createServer } from "./wsServer";
 import WebSocket from "ws";
@@ -43,6 +43,10 @@ import { TerminalManager, type TerminalManagerShape } from "./terminal/Services/
 import { makeSqlitePersistenceLive, SqlitePersistenceMemory } from "./persistence/Layers/Sqlite";
 import { SqlClient, SqlError } from "effect/unstable/sql";
 import { ProviderService, type ProviderServiceShape } from "./provider/Services/ProviderService";
+import {
+  ProviderSessionDirectory,
+  type ProviderSessionDirectoryShape,
+} from "./provider/Services/ProviderSessionDirectory";
 import { ProviderHealth, type ProviderHealthShape } from "./provider/Services/ProviderHealth";
 import { Open, type OpenShape } from "./open";
 import { GitManager, type GitManagerShape } from "./git/Services/GitManager.ts";
@@ -390,7 +394,7 @@ describe("WebSocket Server", () => {
       authToken?: string;
       stateDir?: string;
       staticDir?: string;
-      providerLayer?: Layer.Layer<ProviderService, never>;
+      providerLayer?: Layer.Layer<ProviderService | ProviderSessionDirectory, never>;
       providerHealth?: ProviderHealthShape;
       open?: OpenShape;
       gitManager?: GitManagerShape;
@@ -406,6 +410,14 @@ describe("WebSocket Server", () => {
     const scope = await Effect.runPromise(Scope.make("sequential"));
     const persistenceLayer = options.persistenceLayer ?? SqlitePersistenceMemory;
     const providerLayer = options.providerLayer ?? makeServerProviderLayer();
+    const providerSessionDirectoryLayer = Layer.succeed(ProviderSessionDirectory, {
+      upsert: () => Effect.void,
+      getProvider: () =>
+        Effect.die(new Error("Provider session directory unavailable in wsServer test.")),
+      getBinding: () => Effect.succeed(Option.none()),
+      remove: () => Effect.void,
+      listThreadIds: () => Effect.succeed([]),
+    } satisfies ProviderSessionDirectoryShape);
     const providerHealthLayer = Layer.succeed(
       ProviderHealth,
       options.providerHealth ?? defaultProviderHealthService,
@@ -415,6 +427,7 @@ describe("WebSocket Server", () => {
       mode: "web",
       port: 0,
       host: undefined,
+      codexAppServerUrl: undefined,
       cwd: options.cwd ?? "/test/project",
       keybindingsConfigPath: path.join(stateDir, "keybindings.json"),
       stateDir,
@@ -425,7 +438,7 @@ describe("WebSocket Server", () => {
       autoBootstrapProjectFromCwd: options.autoBootstrapProjectFromCwd ?? false,
       logWebSocketEvents: options.logWebSocketEvents ?? Boolean(options.devUrl),
     } satisfies ServerConfigShape);
-    const infrastructureLayer = providerLayer.pipe(Layer.provideMerge(persistenceLayer));
+    const infrastructureLayer = Layer.mergeAll(providerLayer, providerSessionDirectoryLayer).pipe(Layer.provideMerge(persistenceLayer));
     const runtimeOverrides = Layer.mergeAll(
       options.gitManager ? Layer.succeed(GitManager, options.gitManager) : Layer.empty,
       options.gitCore
@@ -1174,7 +1187,17 @@ describe("WebSocket Server", () => {
       rollbackConversation: () => unsupported(),
       streamEvents: Stream.fromPubSub(runtimeEventPubSub),
     };
-    const providerLayer = Layer.succeed(ProviderService, providerService);
+    const providerLayer = Layer.mergeAll(
+      Layer.succeed(ProviderService, providerService),
+      Layer.succeed(ProviderSessionDirectory, {
+        upsert: () => Effect.void,
+        getProvider: () =>
+          Effect.die(new Error("Provider session directory unavailable in wsServer test.")),
+        getBinding: () => Effect.succeed(Option.none()),
+        remove: () => Effect.void,
+        listThreadIds: () => Effect.succeed([]),
+      } satisfies ProviderSessionDirectoryShape),
+    );
 
     server = await createTestServer({
       cwd: "/test",

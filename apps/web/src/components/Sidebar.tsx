@@ -1,5 +1,6 @@
 import {
   ChevronRightIcon,
+  FileIcon,
   FolderIcon,
   GitPullRequestIcon,
   RocketIcon,
@@ -10,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DEFAULT_RUNTIME_MODE,
   DEFAULT_MODEL_BY_PROVIDER,
+  type CodexSourceConfig,
   type DesktopUpdateState,
   ProjectId,
   ThreadId,
@@ -18,13 +20,22 @@ import {
 } from "@t3tools/contracts";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
-import { useAppSettings } from "../appSettings";
+import {
+  type AppSettings,
+  bindCodexSourceFolderLabel,
+  bindProjectCodexSourceIds,
+  bindThreadCodexSourceIds,
+  resolveConfiguredCodexSources,
+  resolveCodexSourceFolderLabel,
+  updateAppSettings,
+  useAppSettings,
+} from "../appSettings";
 import { isElectron } from "../env";
 import { APP_STAGE_LABEL } from "../branding";
 import { newCommandId, newProjectId, newThreadId } from "../lib/utils";
 import { useStore } from "../store";
 import { isChatNewLocalShortcut, isChatNewShortcut, shortcutLabelForCommand } from "../keybindings";
-import { type Thread } from "../types";
+import { type Project, type Thread } from "../types";
 import { derivePendingApprovals } from "../session-logic";
 import { gitRemoveWorktreeMutationOptions, gitStatusQueryOptions } from "../lib/gitReactQuery";
 import { serverConfigQueryOptions } from "../lib/serverReactQuery";
@@ -59,10 +70,243 @@ import {
   SidebarTrigger,
 } from "./ui/sidebar";
 import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "../worktreeCleanup";
+import { setPendingCodexSourceFocus } from "../codexSourceUi";
+import {
+  buildCodexSourceProjectWorkspaceRoot,
+  isCodexSourceProjectWorkspaceRoot,
+  parseCodexSourceProjectWorkspaceRoot,
+} from "@t3tools/shared/codexSourceProject";
+import { parseCodexSourceThreadId } from "@t3tools/shared/codexSourceThread";
 import { isNonEmpty as isNonEmptyString } from "effect/String";
 
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 const THREAD_PREVIEW_LIMIT = 6;
+const AUTO_BOOTSTRAP_HISTORY_LIMIT = 1000;
+const codexSourceSetupTasks = new Map<string, Promise<void>>();
+
+function runCodexSourceSetupTask(
+  sourceId: string,
+  task: () => Promise<void>,
+): Promise<void> {
+  const existingTask = codexSourceSetupTasks.get(sourceId);
+  if (existingTask) {
+    return existingTask;
+  }
+
+  const nextTask = task();
+  codexSourceSetupTasks.set(sourceId, nextTask);
+  void nextTask.finally(() => {
+    if (codexSourceSetupTasks.get(sourceId) === nextTask) {
+      codexSourceSetupTasks.delete(sourceId);
+    }
+  });
+  return nextTask;
+}
+
+function normalizeCodexSourceIds(ids: readonly (string | null | undefined)[]): string[] {
+  return [
+    ...new Set(
+      ids
+        .map((value) => value?.trim())
+        .filter((value): value is string => typeof value === "string" && isNonEmptyString(value)),
+    ),
+  ];
+}
+
+function isVisibleCodexSourceProjectThread(
+  settings: Pick<AppSettings, "threadCodexSourceBindings">,
+  sourceId: string,
+  thread: Thread,
+): boolean {
+  const parsedThreadId = parseCodexSourceThreadId(thread.id);
+  if (parsedThreadId?.sourceId === sourceId) {
+    return true;
+  }
+
+  return settings.threadCodexSourceBindings[thread.id] === sourceId;
+}
+
+function resolveSidebarProjectThreads(
+  settings: Pick<AppSettings, "threadCodexSourceBindings">,
+  project: Pick<Project, "id" | "cwd">,
+  threads: readonly Thread[],
+): Thread[] {
+  const sourceProjectSourceId = parseCodexSourceProjectWorkspaceRoot(project.cwd);
+  return threads.filter((thread) => {
+    if (thread.projectId !== project.id) {
+      return false;
+    }
+    if (!sourceProjectSourceId) {
+      return true;
+    }
+    return isVisibleCodexSourceProjectThread(settings, sourceProjectSourceId, thread);
+  });
+}
+
+function findCodexSourceProject(sourceId: string): Project | null {
+  const workspaceRoot = buildCodexSourceProjectWorkspaceRoot(sourceId);
+  return useStore.getState().projects.find((project) => project.cwd === workspaceRoot) ?? null;
+}
+
+function findCodexSourceProjectIdInSnapshot(
+  snapshotProjects: ReadonlyArray<{
+    readonly id: ProjectId;
+    readonly deletedAt: string | null;
+    readonly workspaceRoot: string;
+  }>,
+  sourceId: string,
+): ProjectId | null {
+  const workspaceRoot = buildCodexSourceProjectWorkspaceRoot(sourceId);
+  return (
+    snapshotProjects.find(
+      (project) => project.deletedAt === null && project.workspaceRoot === workspaceRoot,
+    )?.id ?? null
+  );
+}
+
+async function createCodexSourceProject(source: CodexSourceConfig): Promise<ProjectId> {
+  const api = readNativeApi();
+  if (!api) {
+    throw new Error("Native API unavailable.");
+  }
+
+  const existingProject = findCodexSourceProject(source.id);
+  if (existingProject) {
+    return existingProject.id;
+  }
+
+  const snapshot = await api.orchestration.getSnapshot();
+  useStore.getState().syncServerReadModel(snapshot);
+  const snapshotProjectId = findCodexSourceProjectIdInSnapshot(snapshot.projects, source.id);
+  if (snapshotProjectId) {
+    return snapshotProjectId;
+  }
+
+  const projectId = newProjectId();
+  await api.orchestration.dispatchCommand({
+    type: "project.create",
+    commandId: newCommandId(),
+    projectId,
+    title: source.name,
+    workspaceRoot: buildCodexSourceProjectWorkspaceRoot(source.id),
+    defaultModel: DEFAULT_MODEL_BY_PROVIDER.codex,
+    createdAt: new Date().toISOString(),
+  });
+
+  const nextSnapshot = await api.orchestration.getSnapshot();
+  useStore.getState().syncServerReadModel(nextSnapshot);
+  return findCodexSourceProjectIdInSnapshot(nextSnapshot.projects, source.id) ?? projectId;
+}
+
+async function ensureCodexSourceSetup(source: CodexSourceConfig): Promise<void> {
+  const api = readNativeApi();
+  if (!api) {
+    return;
+  }
+
+  await runCodexSourceSetupTask(source.id, async () => {
+    const supportsAutoBootstrap = source.kind === "local" || source.kind === "remoteSsh";
+    let threadIdsToBind: string[] = [];
+    let projectIdsToBind: string[] = [];
+    let sourceFolderLabel: string | null = null;
+
+    if (supportsAutoBootstrap) {
+      try {
+        const result = await api.server.importCodexHistory({
+          source,
+          limit: AUTO_BOOTSTRAP_HISTORY_LIMIT,
+        });
+        const snapshot = await api.orchestration.getSnapshot();
+        useStore.getState().syncServerReadModel(snapshot);
+
+        threadIdsToBind = normalizeCodexSourceIds(result.threadIds);
+        projectIdsToBind = normalizeCodexSourceIds([
+          ...result.projectIds,
+          findCodexSourceProjectIdInSnapshot(snapshot.projects, source.id),
+        ]);
+        sourceFolderLabel = result.sourceFolderLabel ?? null;
+      } catch (error) {
+        console.warn("Failed to auto-mirror Codex history", {
+          sourceId: source.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (projectIdsToBind.length === 0) {
+      projectIdsToBind = normalizeCodexSourceIds([
+        findCodexSourceProject(source.id)?.id,
+        await createCodexSourceProject(source),
+      ]);
+    }
+
+    updateAppSettings((settings) => {
+      const shouldUpdateProjectBindings = projectIdsToBind.some(
+        (projectId) => settings.projectCodexSourceBindings[projectId] !== source.id,
+      );
+      const shouldUpdateThreadBindings = threadIdsToBind.some(
+        (threadId) => settings.threadCodexSourceBindings[threadId] !== source.id,
+      );
+      const shouldUpdateSourceFolderLabel =
+        sourceFolderLabel !== null &&
+        resolveCodexSourceFolderLabel(settings, source.id) !== sourceFolderLabel;
+
+      if (
+        !shouldUpdateProjectBindings &&
+        !shouldUpdateThreadBindings &&
+        !shouldUpdateSourceFolderLabel
+      ) {
+        return settings;
+      }
+
+      return {
+        ...settings,
+        ...(shouldUpdateProjectBindings
+          ? {
+              projectCodexSourceBindings: bindProjectCodexSourceIds(
+                settings,
+                projectIdsToBind,
+                source.id,
+              ),
+            }
+          : {}),
+        ...(shouldUpdateThreadBindings
+          ? {
+              threadCodexSourceBindings: bindThreadCodexSourceIds(
+                settings,
+                threadIdsToBind,
+                source.id,
+              ),
+            }
+          : {}),
+        ...(shouldUpdateSourceFolderLabel
+          ? {
+              codexSourceFolderLabels: bindCodexSourceFolderLabel(
+                settings,
+                source.id,
+                sourceFolderLabel,
+              ),
+            }
+          : {}),
+      };
+    });
+  });
+}
+
+function resolveSidebarThreadTimestamp(thread: Thread): string {
+  if (parseCodexSourceThreadId(thread.id)) {
+    return thread.createdAt;
+  }
+
+  return (
+    thread.session?.updatedAt ??
+    thread.latestTurn?.completedAt ??
+    thread.latestTurn?.startedAt ??
+    thread.messages.at(-1)?.completedAt ??
+    thread.messages.at(-1)?.createdAt ??
+    thread.createdAt
+  );
+}
 
 async function copyTextToClipboard(text: string): Promise<void> {
   if (typeof navigator === "undefined" || navigator.clipboard?.writeText === undefined) {
@@ -226,7 +470,7 @@ function getServerHttpOrigin(): string {
       : envUrl && envUrl.length > 0
         ? envUrl
         : `ws://${window.location.hostname}:${window.location.port}`;
-  // Parse to extract just the origin, dropping path/query (e.g. ?token=…)
+  // Parse to extract just the origin and drop path or query details.
   const httpUrl = wsUrl.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
   try {
     return new URL(httpUrl).origin;
@@ -238,11 +482,11 @@ function getServerHttpOrigin(): string {
 const serverHttpOrigin = getServerHttpOrigin();
 
 function ProjectFavicon({ cwd }: { cwd: string }) {
+  const isSourceProject = isCodexSourceProjectWorkspaceRoot(cwd);
   const [status, setStatus] = useState<"loading" | "loaded" | "error">("loading");
-
   const src = `${serverHttpOrigin}/api/project-favicon?cwd=${encodeURIComponent(cwd)}`;
 
-  if (status === "error") {
+  if (isSourceProject || status === "error") {
     return <FolderIcon className="size-3.5 shrink-0 text-muted-foreground/50" />;
   }
 
@@ -260,6 +504,7 @@ function ProjectFavicon({ cwd }: { cwd: string }) {
 export default function Sidebar() {
   const projects = useStore((store) => store.projects);
   const threads = useStore((store) => store.threads);
+  const threadsHydrated = useStore((store) => store.threadsHydrated);
   const markThreadUnread = useStore((store) => store.markThreadUnread);
   const toggleProject = useStore((store) => store.toggleProject);
   const clearComposerDraftForThread = useComposerDraftStore((store) => store.clearThreadDraft);
@@ -295,6 +540,9 @@ export default function Sidebar() {
   const [isAddingProject, setIsAddingProject] = useState(false);
   const [renamingThreadId, setRenamingThreadId] = useState<ThreadId | null>(null);
   const [renamingTitle, setRenamingTitle] = useState("");
+  const [collapsedSourceFoldersByProject, setCollapsedSourceFoldersByProject] = useState<
+    ReadonlySet<ProjectId>
+  >(() => new Set());
   const [expandedThreadListsByProject, setExpandedThreadListsByProject] = useState<
     ReadonlySet<ProjectId>
   >(() => new Set());
@@ -308,6 +556,43 @@ export default function Sidebar() {
     }
     return map;
   }, [threads]);
+  const codexSourcesKey = useMemo(
+    () => JSON.stringify(appSettings.codexSources),
+    [appSettings.codexSources],
+  );
+  const configuredCodexSources = useMemo(
+    () => resolveConfiguredCodexSources({ codexSources: JSON.parse(codexSourcesKey) }),
+    [codexSourcesKey],
+  );
+  const codexSourceById = useMemo(
+    () => new Map(configuredCodexSources.map((source) => [source.id, source] as const)),
+    [configuredCodexSources],
+  );
+  const sourceProjectBySourceId = useMemo(() => {
+    const map = new Map<string, Project>();
+    for (const project of projects) {
+      const sourceId = parseCodexSourceProjectWorkspaceRoot(project.cwd);
+      if (!sourceId || !codexSourceById.has(sourceId) || map.has(sourceId)) {
+        continue;
+      }
+      map.set(sourceId, project);
+    }
+    return map;
+  }, [codexSourceById, projects]);
+  const visibleProjects = useMemo(() => {
+    const seenProjectIds = new Set<ProjectId>();
+    const orderedSourceProjects = configuredCodexSources
+      .map((source) => sourceProjectBySourceId.get(source.id))
+      .filter((project): project is Project => project !== undefined)
+      .filter((project) => {
+        if (seenProjectIds.has(project.id)) {
+          return false;
+        }
+        seenProjectIds.add(project.id);
+        return true;
+      });
+    return [...orderedSourceProjects, ...projects.filter((project) => !seenProjectIds.has(project.id))];
+  }, [configuredCodexSources, projects, sourceProjectBySourceId]);
   const projectCwdById = useMemo(
     () => new Map(projects.map((project) => [project.id, project.cwd] as const)),
     [projects],
@@ -448,8 +733,8 @@ export default function Sidebar() {
     [
       clearProjectDraftThreadId,
       getDraftThreadByProjectId,
-      navigate,
       getDraftThread,
+      navigate,
       routeThreadId,
       setDraftThreadContext,
       setProjectDraftThreadId,
@@ -748,20 +1033,69 @@ export default function Sidebar() {
     ],
   );
 
+  const openCodexSourceSettings = useCallback(
+    async (sourceId: string) => {
+      setPendingCodexSourceFocus(sourceId);
+      await navigate({ to: "/settings" });
+    },
+    [navigate],
+  );
+
   const handleProjectContextMenu = useCallback(
     async (projectId: ProjectId, position: { x: number; y: number }) => {
       const api = readNativeApi();
       if (!api) return;
-      const clicked = await api.contextMenu.show(
-        [{ id: "delete", label: "Delete", destructive: true }],
-        position,
-      );
-      if (clicked !== "delete") return;
 
       const project = projects.find((entry) => entry.id === projectId);
       if (!project) return;
 
-      const projectThreads = threads.filter((thread) => thread.projectId === projectId);
+      const sourceId = parseCodexSourceProjectWorkspaceRoot(project.cwd);
+      const clicked = await api.contextMenu.show(
+        [
+          ...(sourceId ? [{ id: "open-source-config", label: "Open source config" }] : []),
+          { id: "rename", label: "Rename folder" },
+          ...(sourceId ? [] : [{ id: "delete", label: "Delete", destructive: true }]),
+        ],
+        position,
+      );
+
+      if (clicked === "open-source-config" && sourceId) {
+        await openCodexSourceSettings(sourceId);
+        return;
+      }
+
+      if (clicked === "rename") {
+        const renamedTitle = window.prompt("Rename folder", project.name);
+        if (renamedTitle === null) {
+          return;
+        }
+        const trimmedTitle = renamedTitle.trim();
+        if (!trimmedTitle) {
+          toastManager.add({ type: "warning", title: "Folder name cannot be empty" });
+          return;
+        }
+        if (trimmedTitle === project.name) {
+          return;
+        }
+        try {
+          await api.orchestration.dispatchCommand({
+            type: "project.meta.update",
+            commandId: newCommandId(),
+            projectId,
+            title: trimmedTitle,
+          });
+        } catch (error) {
+          toastManager.add({
+            type: "error",
+            title: `Failed to rename "${project.name}"`,
+            description: error instanceof Error ? error.message : "An error occurred.",
+          });
+        }
+        return;
+      }
+
+      if (clicked !== "delete") return;
+      const projectThreads = resolveSidebarProjectThreads(appSettings, project, threads);
       if (projectThreads.length > 0) {
         toastManager.add({
           type: "warning",
@@ -798,13 +1132,53 @@ export default function Sidebar() {
       }
     },
     [
+      appSettings,
       clearComposerDraftForThread,
       clearProjectDraftThreadId,
       getDraftThreadByProjectId,
+      openCodexSourceSettings,
       projects,
       threads,
     ],
   );
+
+  useEffect(() => {
+    if (!threadsHydrated) {
+      return;
+    }
+
+    if (!readNativeApi()) {
+      return;
+    }
+
+    let disposed = false;
+
+    void (async () => {
+      for (const source of configuredCodexSources) {
+        if (disposed) {
+          return;
+        }
+
+        try {
+          await ensureCodexSourceSetup(source);
+        } catch (error) {
+          console.warn("Failed to ensure Codex source setup", {
+            sourceId: source.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    })();
+
+    return () => {
+      disposed = true;
+    };
+  }, [
+    appSettings.bootstrappedCodexSourceIds,
+    configuredCodexSources,
+    sourceProjectBySourceId,
+    threadsHydrated,
+  ]);
 
   useEffect(() => {
     const onWindowKeyDown = (event: KeyboardEvent) => {
@@ -814,7 +1188,7 @@ export default function Sidebar() {
       const activeDraftThread = routeThreadId ? getDraftThread(routeThreadId) : null;
       if (isChatNewLocalShortcut(event, keybindings)) {
         const projectId =
-          activeThread?.projectId ?? activeDraftThread?.projectId ?? projects[0]?.id;
+          activeThread?.projectId ?? activeDraftThread?.projectId ?? visibleProjects[0]?.id;
         if (!projectId) return;
         event.preventDefault();
         void handleNewThread(projectId);
@@ -822,7 +1196,7 @@ export default function Sidebar() {
       }
 
       if (!isChatNewShortcut(event, keybindings)) return;
-      const projectId = activeThread?.projectId ?? activeDraftThread?.projectId ?? projects[0]?.id;
+      const projectId = activeThread?.projectId ?? activeDraftThread?.projectId ?? visibleProjects[0]?.id;
       if (!projectId) return;
       event.preventDefault();
       void handleNewThread(projectId, {
@@ -836,7 +1210,7 @@ export default function Sidebar() {
     return () => {
       window.removeEventListener("keydown", onWindowKeyDown);
     };
-  }, [getDraftThread, handleNewThread, keybindings, projects, routeThreadId, threads]);
+  }, [getDraftThread, handleNewThread, keybindings, routeThreadId, threads, visibleProjects]);
 
   useEffect(() => {
     if (!isElectron) return;
@@ -975,6 +1349,22 @@ export default function Sidebar() {
     });
   }, []);
 
+  const setSourceFolderExpandedForProject = useCallback((projectId: ProjectId, expanded: boolean) => {
+    setCollapsedSourceFoldersByProject((current) => {
+      const isExpanded = !current.has(projectId);
+      if (isExpanded === expanded) {
+        return current;
+      }
+      const next = new Set(current);
+      if (expanded) {
+        next.delete(projectId);
+      } else {
+        next.add(projectId);
+      }
+      return next;
+    });
+  }, []);
+
   const wordmark = (
     <div className="flex items-center gap-2">
       <SidebarTrigger className="shrink-0 md:hidden" />
@@ -1026,20 +1416,31 @@ export default function Sidebar() {
       <SidebarContent className="gap-0">
         <SidebarGroup className="px-2 py-2">
           <SidebarMenu>
-            {projects.map((project) => {
-              const projectThreads = threads
-                .filter((thread) => thread.projectId === project.id)
+            {visibleProjects.map((project) => {
+              const sourceProjectSourceId = parseCodexSourceProjectWorkspaceRoot(project.cwd);
+              const sourceProjectSource = sourceProjectSourceId
+                ? (codexSourceById.get(sourceProjectSourceId) ?? null)
+                : null;
+              const projectThreads = resolveSidebarProjectThreads(appSettings, project, threads)
                 .toSorted((a, b) => {
-                  const byDate = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+                  const byDate =
+                    new Date(resolveSidebarThreadTimestamp(b)).getTime() -
+                    new Date(resolveSidebarThreadTimestamp(a)).getTime();
                   if (byDate !== 0) return byDate;
                   return b.id.localeCompare(a.id);
                 });
+              const isSourceFolderExpanded = sourceProjectSource
+                ? !collapsedSourceFoldersByProject.has(project.id)
+                : true;
               const isThreadListExpanded = expandedThreadListsByProject.has(project.id);
               const hasHiddenThreads = projectThreads.length > THREAD_PREVIEW_LIMIT;
               const visibleThreads =
                 hasHiddenThreads && !isThreadListExpanded
                   ? projectThreads.slice(0, THREAD_PREVIEW_LIMIT)
                   : projectThreads;
+              const sourceFolderLabel = sourceProjectSourceId
+                ? resolveCodexSourceFolderLabel(appSettings, sourceProjectSourceId)
+                : null;
 
               return (
                 <Collapsible
@@ -1110,7 +1511,49 @@ export default function Sidebar() {
 
                     <CollapsibleContent>
                       <SidebarMenuSub className="mx-1 my-0 w-full translate-x-0 gap-0 px-1.5 py-0">
-                        {visibleThreads.map((thread) => {
+                        {sourceProjectSource ? (
+                          <SidebarMenuSubItem className="w-full">
+                            <SidebarMenuSubButton
+                              render={<button type="button" />}
+                              size="sm"
+                              className="h-7 w-full translate-x-0 justify-start gap-1.5 px-2 text-left font-mono text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+                              onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                void openCodexSourceSettings(sourceProjectSource.id);
+                              }}
+                            >
+                              <FileIcon className="size-3 shrink-0" />
+                              <span className="truncate">codex.config.json</span>
+                            </SidebarMenuSubButton>
+                          </SidebarMenuSubItem>
+                        ) : null}
+                        {sourceProjectSource ? (
+                          <SidebarMenuSubItem className="w-full">
+                            <SidebarMenuSubButton
+                              render={<button type="button" />}
+                              size="sm"
+                              className="h-7 w-full translate-x-0 cursor-pointer justify-start gap-1.5 px-2 text-left text-muted-foreground hover:bg-accent hover:text-foreground"
+                              onClick={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                                setSourceFolderExpandedForProject(project.id, !isSourceFolderExpanded);
+                              }}
+                            >
+                              <ChevronRightIcon
+                                className={`size-3 shrink-0 transition-transform duration-150 ${
+                                  isSourceFolderExpanded ? "rotate-90" : ""
+                                }`}
+                              />
+                              <FolderIcon className="size-3 shrink-0" />
+                              <span className="truncate text-xs">
+                                {sourceFolderLabel ?? sourceProjectSource.name}
+                              </span>
+                            </SidebarMenuSubButton>
+                          </SidebarMenuSubItem>
+                        ) : null}
+                        {(!sourceProjectSource || isSourceFolderExpanded) &&
+                          visibleThreads.map((thread) => {
                           const isActive = routeThreadId === thread.id;
                           const threadStatus = threadStatusPill(
                             thread,
@@ -1128,7 +1571,9 @@ export default function Sidebar() {
                                 render={<div role="button" tabIndex={0} />}
                                 size="sm"
                                 isActive={isActive}
-                                className={`h-7 w-full translate-x-0 cursor-default justify-start px-2 text-left hover:bg-accent hover:text-foreground ${
+                                className={`h-7 w-full translate-x-0 cursor-default justify-start ${
+                                  sourceProjectSource ? "pl-6 pr-2" : "px-2"
+                                } text-left hover:bg-accent hover:text-foreground ${
                                   isActive
                                     ? "bg-accent/85 text-foreground font-medium ring-1 ring-border/70 dark:bg-accent/55 dark:ring-border/50"
                                     : "text-muted-foreground"
@@ -1242,7 +1687,7 @@ export default function Sidebar() {
                                       isActive ? "text-foreground/65" : "text-muted-foreground/40"
                                     }`}
                                   >
-                                    {formatRelativeTime(thread.createdAt)}
+                                    {formatRelativeTime(resolveSidebarThreadTimestamp(thread))}
                                   </span>
                                 </div>
                               </SidebarMenuSubButton>
@@ -1250,12 +1695,16 @@ export default function Sidebar() {
                           );
                         })}
 
-                        {hasHiddenThreads && !isThreadListExpanded && (
+                        {(!sourceProjectSource || isSourceFolderExpanded) &&
+                          hasHiddenThreads &&
+                          !isThreadListExpanded && (
                           <SidebarMenuSubItem className="w-full">
                             <SidebarMenuSubButton
                               render={<button type="button" />}
                               size="sm"
-                              className="h-6 w-full translate-x-0 justify-start px-2 text-left text-[10px] text-muted-foreground/60 hover:bg-accent hover:text-muted-foreground/80"
+                              className={`h-6 w-full translate-x-0 justify-start ${
+                                sourceProjectSource ? "pl-6 pr-2" : "px-2"
+                              } text-left text-[10px] text-muted-foreground/60 hover:bg-accent hover:text-muted-foreground/80`}
                               onClick={() => {
                                 expandThreadListForProject(project.id);
                               }}
@@ -1264,12 +1713,16 @@ export default function Sidebar() {
                             </SidebarMenuSubButton>
                           </SidebarMenuSubItem>
                         )}
-                        {hasHiddenThreads && isThreadListExpanded && (
+                        {(!sourceProjectSource || isSourceFolderExpanded) &&
+                          hasHiddenThreads &&
+                          isThreadListExpanded && (
                           <SidebarMenuSubItem className="w-full">
                             <SidebarMenuSubButton
                               render={<button type="button" />}
                               size="sm"
-                              className="h-6 w-full translate-x-0 justify-start px-2 text-left text-[10px] text-muted-foreground/60 hover:bg-accent hover:text-muted-foreground/80"
+                              className={`h-6 w-full translate-x-0 justify-start ${
+                                sourceProjectSource ? "pl-6 pr-2" : "px-2"
+                              } text-left text-[10px] text-muted-foreground/60 hover:bg-accent hover:text-muted-foreground/80`}
                               onClick={() => {
                                 collapseThreadListForProject(project.id);
                               }}
@@ -1286,7 +1739,7 @@ export default function Sidebar() {
             })}
           </SidebarMenu>
 
-          {projects.length === 0 && !addingProject && (
+          {visibleProjects.length === 0 && !addingProject && (
             <div className="px-2 pt-4 text-center text-xs text-muted-foreground/60">
               No projects yet.
               <br />
@@ -1354,3 +1807,9 @@ export default function Sidebar() {
     </>
   );
 }
+
+
+
+
+
+

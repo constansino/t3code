@@ -28,6 +28,7 @@ import {
   WsResponse,
 } from "@t3tools/contracts";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
+import { isCodexSourceProjectWorkspaceRoot } from "@t3tools/shared/codexSourceProject";
 import {
   Cause,
   Effect,
@@ -73,6 +74,8 @@ import {
 import { parseBase64DataUrl } from "./imageMime.ts";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService.ts";
 import { expandHomePath } from "./os-jank.ts";
+import { importCodexHistory, listCodexHistory } from "./codexHistory";
+import { ProviderSessionDirectory } from "./provider/Services/ProviderSessionDirectory";
 
 /**
  * ServerShape - Service API for server lifecycle control.
@@ -153,6 +156,27 @@ function toPosixRelativePath(input: string): string {
   return input.replaceAll("\\", "/");
 }
 
+function getStaticCacheHeaders(filePath: string): Record<string, string> {
+  const normalizedPath = toPosixRelativePath(filePath).toLowerCase();
+  if (normalizedPath.endsWith("/index.html") || normalizedPath.endsWith(".html")) {
+    return {
+      "Cache-Control": "no-store, no-cache, must-revalidate",
+      Pragma: "no-cache",
+      Expires: "0",
+    };
+  }
+
+  if (normalizedPath.includes("/assets/")) {
+    return {
+      "Cache-Control": "public, max-age=31536000, immutable",
+    };
+  }
+
+  return {
+    "Cache-Control": "public, max-age=300",
+  };
+}
+
 function resolveWorkspaceWritePath(params: {
   workspaceRoot: string;
   relativePath: string;
@@ -208,6 +232,7 @@ export type ServerCoreRuntimeServices =
   | CheckpointDiffQuery
   | OrchestrationReactor
   | ProviderService
+  | ProviderSessionDirectory
   | ProviderHealth;
 
 export type ServerRuntimeServices =
@@ -307,7 +332,12 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     readonly command: ClientOrchestrationCommand;
   }) {
     const normalizeProjectWorkspaceRoot = Effect.fnUntraced(function* (workspaceRoot: string) {
-      const normalizedWorkspaceRoot = path.resolve(yield* expandHomePath(workspaceRoot.trim()));
+      const trimmedWorkspaceRoot = workspaceRoot.trim();
+      if (isCodexSourceProjectWorkspaceRoot(trimmedWorkspaceRoot)) {
+        return trimmedWorkspaceRoot;
+      }
+
+      const normalizedWorkspaceRoot = path.resolve(yield* expandHomePath(trimmedWorkspaceRoot));
       const workspaceStat = yield* fileSystem
         .stat(normalizedWorkspaceRoot)
         .pipe(Effect.catch(() => Effect.succeed(null)));
@@ -420,7 +450,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     } satisfies OrchestrationCommand;
   });
 
-  // HTTP server — serves static files or redirects to Vite dev server
+  // HTTP server 鈥?serves static files or redirects to Vite dev server
   const httpServer = http.createServer((req, res) => {
     const respond = (
       statusCode: number,
@@ -563,7 +593,14 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
             respond(404, { "Content-Type": "text/plain" }, "Not Found");
             return;
           }
-          respond(200, { "Content-Type": "text/html; charset=utf-8" }, indexData);
+          respond(
+            200,
+            {
+              "Content-Type": "text/html; charset=utf-8",
+              ...getStaticCacheHeaders(indexPath),
+            },
+            indexData,
+          );
           return;
         }
 
@@ -575,7 +612,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           respond(500, { "Content-Type": "text/plain" }, "Internal Server Error");
           return;
         }
-        respond(200, { "Content-Type": contentType }, data);
+        respond(200, { "Content-Type": contentType, ...getStaticCacheHeaders(filePath) }, data);
       }),
     ).catch(() => {
       if (!res.headersSent) {
@@ -584,7 +621,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     });
   });
 
-  // WebSocket server — upgrades from the HTTP server
+  // WebSocket server 鈥?upgrades from the HTTP server
   const wss = new WebSocketServer({ noServer: true });
 
   const closeWebSocketServer = Effect.callback<void, ServerLifecycleError>((resume) => {
@@ -612,6 +649,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
   const projectionReadModelQuery = yield* ProjectionSnapshotQuery;
   const checkpointDiffQuery = yield* CheckpointDiffQuery;
   const orchestrationReactor = yield* OrchestrationReactor;
+  const providerSessionDirectory = yield* ProviderSessionDirectory;
   const { openInEditor } = yield* Open;
 
   const subscriptionsScope = yield* Scope.make("sequential");
@@ -891,6 +929,42 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
         const body = stripRequestTag(request.body);
         const keybindingsConfig = yield* keybindingsManager.upsertKeybindingRule(body);
         return { keybindings: keybindingsConfig, issues: [] };
+      }
+
+      case WS_METHODS.serverListCodexHistory: {
+        const body = stripRequestTag(request.body);
+        return yield* Effect.tryPromise({
+          try: () => listCodexHistory(body),
+          catch: (cause) =>
+            new RouteRequestError({
+              message:
+                cause instanceof Error
+                  ? cause.message
+                  : `Failed to list Codex history: ${String(cause)}`,
+            }),
+        });
+      }
+
+      case WS_METHODS.serverImportCodexHistory: {
+        const body = stripRequestTag(request.body);
+        return yield* Effect.tryPromise({
+          try: () =>
+            importCodexHistory(
+              {
+                orchestrationEngine,
+                providerSessionDirectory,
+                runPromise,
+              },
+              body,
+            ),
+          catch: (cause) =>
+            new RouteRequestError({
+              message:
+                cause instanceof Error
+                  ? cause.message
+                  : `Failed to import Codex history: ${String(cause)}`,
+            }),
+        });
       }
 
       default: {

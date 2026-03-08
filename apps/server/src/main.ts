@@ -17,12 +17,14 @@ import {
   type ServerConfigShape,
 } from "./config";
 import { fixPath, resolveStateDir } from "./os-jank";
-import { Open } from "./open";
+import { Open, OpenLive } from "./open";
 import * as SqlitePersistence from "./persistence/Layers/Sqlite";
+import { ProviderSessionRuntimeRepositoryLive } from "./persistence/Layers/ProviderSessionRuntime";
 import { makeServerProviderLayer, makeServerRuntimeServicesLayer } from "./serverLayers";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import { ProviderHealthLive } from "./provider/Layers/ProviderHealth";
-import { Server } from "./wsServer";
+import { ProviderSessionDirectoryLive } from "./provider/Layers/ProviderSessionDirectory";
+import { Server, ServerLive } from "./wsServer";
 import { ServerLoggerLive } from "./serverLogger";
 import { AnalyticsServiceLayerLive } from "./telemetry/Layers/AnalyticsService";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService";
@@ -36,6 +38,7 @@ interface CliInput {
   readonly mode: Option.Option<RuntimeMode>;
   readonly port: Option.Option<number>;
   readonly host: Option.Option<string>;
+  readonly codexAppServerUrl: Option.Option<string>;
   readonly stateDir: Option.Option<string>;
   readonly devUrl: Option.Option<URL>;
   readonly noBrowser: Option.Option<boolean>;
@@ -99,6 +102,10 @@ const CliEnvConfig = Config.all({
   ),
   port: Config.port("T3CODE_PORT").pipe(Config.option, Config.map(Option.getOrUndefined)),
   host: Config.string("T3CODE_HOST").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  codexAppServerUrl: Config.string("T3CODE_CODEX_APP_SERVER_URL").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   stateDir: Config.string("T3CODE_STATE_DIR").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -124,6 +131,20 @@ const CliEnvConfig = Config.all({
 
 const resolveBooleanFlag = (flag: Option.Option<boolean>, envValue: boolean) =>
   Option.getOrElse(Option.filter(flag, Boolean), () => envValue);
+
+const normalizeCodexAppServerUrl = (value: string | undefined): string | undefined => {
+  const normalized = value?.trim();
+  if (!normalized) {
+    return undefined;
+  }
+
+  const parsed = new URL(normalized);
+  if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
+    throw new Error("Codex app-server URL must use the ws:// or wss:// scheme.");
+  }
+
+  return parsed.toString();
+};
 
 const ServerConfigLive = (input: CliInput) =>
   Layer.effect(
@@ -166,6 +187,18 @@ const ServerConfigLive = (input: CliInput) =>
         input.logWebSocketEvents,
         env.logWebSocketEvents ?? Boolean(devUrl),
       );
+      const codexAppServerUrl = yield* Effect.try({
+        try: () =>
+          normalizeCodexAppServerUrl(
+            Option.getOrUndefined(input.codexAppServerUrl) ?? env.codexAppServerUrl,
+          ),
+        catch: (cause) =>
+          new StartupError({
+            message:
+              "Failed to resolve Codex app-server URL. Use a valid ws:// or wss:// URL.",
+            cause,
+          }),
+      });
       const staticDir = devUrl ? undefined : yield* cliConfig.resolveStaticDir;
       const { join } = yield* Path.Path;
       const keybindingsConfigPath = join(stateDir, "keybindings.json");
@@ -178,6 +211,7 @@ const ServerConfigLive = (input: CliInput) =>
         mode,
         port,
         cwd: cliConfig.cwd,
+        codexAppServerUrl,
         keybindingsConfigPath,
         host,
         stateDir,
@@ -195,7 +229,14 @@ const ServerConfigLive = (input: CliInput) =>
 
 const LayerLive = (input: CliInput) =>
   Layer.empty.pipe(
+    Layer.provideMerge(ServerLive),
+    Layer.provideMerge(OpenLive),
     Layer.provideMerge(makeServerRuntimeServicesLayer()),
+    Layer.provideMerge(
+      ProviderSessionDirectoryLive.pipe(
+        Layer.provide(ProviderSessionRuntimeRepositoryLive),
+      ),
+    ),
     Layer.provideMerge(makeServerProviderLayer()),
     Layer.provideMerge(ProviderHealthLive),
     Layer.provideMerge(SqlitePersistence.layerConfig),
@@ -299,6 +340,12 @@ const hostFlag = Flag.string("host").pipe(
   Flag.withDescription("Host/interface to bind (for example 127.0.0.1, 0.0.0.0, or a Tailnet IP)."),
   Flag.optional,
 );
+const codexAppServerUrlFlag = Flag.string("codex-app-server-url").pipe(
+  Flag.withDescription(
+    "Remote Codex app-server WebSocket URL to use instead of spawning a local Codex CLI.",
+  ),
+  Flag.optional,
+);
 const stateDirFlag = Flag.string("state-dir").pipe(
   Flag.withDescription("State directory path (equivalent to T3CODE_STATE_DIR)."),
   Flag.optional,
@@ -335,6 +382,7 @@ export const t3Cli = Command.make("t3", {
   mode: modeFlag,
   port: portFlag,
   host: hostFlag,
+  codexAppServerUrl: codexAppServerUrlFlag,
   stateDir: stateDirFlag,
   devUrl: devUrlFlag,
   noBrowser: noBrowserFlag,

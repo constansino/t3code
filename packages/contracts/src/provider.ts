@@ -51,6 +51,7 @@ export type ProviderSession = typeof ProviderSession.Type;
 const CodexProviderStartOptions = Schema.Struct({
   binaryPath: Schema.optional(TrimmedNonEmptyStringSchema),
   homePath: Schema.optional(TrimmedNonEmptyStringSchema),
+  appServerUrl: Schema.optional(TrimmedNonEmptyStringSchema),
 });
 
 const ProviderStartOptions = Schema.Struct({

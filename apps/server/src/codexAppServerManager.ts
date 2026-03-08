@@ -1,7 +1,6 @@
-import { type ChildProcessWithoutNullStreams, spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import readline from "node:readline";
 
 import {
   ApprovalRequestId,
@@ -27,6 +26,11 @@ import {
   isCodexCliVersionSupported,
   parseCodexCliVersion,
 } from "./provider/codexCliVersion";
+import {
+  createCodexAppServerTransport,
+  type CodexAppServerTransport,
+  type CreateCodexAppServerTransportInput,
+} from "./codexAppServerTransport";
 
 type PendingRequestKey = string;
 
@@ -65,8 +69,7 @@ interface CodexUserInputAnswer {
 interface CodexSessionContext {
   session: ProviderSession;
   account: CodexAccountSnapshot;
-  child: ChildProcessWithoutNullStreams;
-  output: readline.Interface;
+  transport: CodexAppServerTransport;
   pending: Map<PendingRequestKey, PendingRequest>;
   pendingApprovals: Map<ApprovalRequestId, PendingApprovalRequest>;
   pendingUserInputs: Map<ApprovalRequestId, PendingUserInputRequest>;
@@ -142,6 +145,21 @@ export interface CodexThreadTurnSnapshot {
 export interface CodexThreadSnapshot {
   threadId: string;
   turns: CodexThreadTurnSnapshot[];
+}
+
+export interface CodexThreadDetailsSnapshot extends CodexThreadSnapshot {
+  name?: string;
+  cwd?: string;
+  path?: string;
+  createdAt?: string | number;
+  updatedAt?: string | number;
+}
+
+export interface CodexAppServerManagerOptions {
+  readonly appServerUrl?: string;
+  readonly createTransport?: (
+    input: CreateCodexAppServerTransportInput,
+  ) => Promise<CodexAppServerTransport>;
 }
 
 const CODEX_VERSION_CHECK_TIMEOUT_MS = 4_000;
@@ -373,18 +391,6 @@ export function resolveCodexModelForAccount(
  * wrapper, leaving the actual command running. Use `taskkill /T` to kill the
  * entire process tree instead.
  */
-function killChildTree(child: ChildProcessWithoutNullStreams): void {
-  if (process.platform === "win32" && child.pid !== undefined) {
-    try {
-      spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
-      return;
-    } catch {
-      // fallback to direct kill
-    }
-  }
-  child.kill();
-}
-
 export function normalizeCodexModelSlug(
   model: string | undefined | null,
   preferredId?: string,
@@ -516,9 +522,16 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   private readonly sessions = new Map<ThreadId, CodexSessionContext>();
 
   private runPromise: (effect: Effect.Effect<unknown, never>) => Promise<unknown>;
-  constructor(services?: ServiceMap.ServiceMap<never>) {
+  private readonly appServerUrl: string | undefined;
+  private readonly createTransport: (
+    input: CreateCodexAppServerTransportInput,
+  ) => Promise<CodexAppServerTransport>;
+
+  constructor(services?: ServiceMap.ServiceMap<never>, options?: CodexAppServerManagerOptions) {
     super();
     this.runPromise = services ? Effect.runPromiseWith(services) : Effect.runPromise;
+    this.appServerUrl = options?.appServerUrl?.trim() || undefined;
+    this.createTransport = options?.createTransport ?? createCodexAppServerTransport;
   }
 
   async startSession(input: CodexAppServerStartSessionInput): Promise<ProviderSession> {
@@ -543,21 +556,21 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       const codexOptions = readCodexProviderOptions(input);
       const codexBinaryPath = codexOptions.binaryPath ?? "codex";
       const codexHomePath = codexOptions.homePath;
-      this.assertSupportedCodexCliVersion({
+      const resolvedAppServerUrl = codexOptions.appServerUrl ?? this.appServerUrl;
+      if (!resolvedAppServerUrl) {
+        this.assertSupportedCodexCliVersion({
+          binaryPath: codexBinaryPath,
+          cwd: resolvedCwd,
+          ...(codexHomePath ? { homePath: codexHomePath } : {}),
+        });
+      }
+
+      const transport = await this.createTransport({
+        cwd: resolvedCwd,
         binaryPath: codexBinaryPath,
-        cwd: resolvedCwd,
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
+        ...(resolvedAppServerUrl ? { appServerUrl: resolvedAppServerUrl } : {}),
       });
-      const child = spawn(codexBinaryPath, ["app-server"], {
-        cwd: resolvedCwd,
-        env: {
-          ...process.env,
-          ...(codexHomePath ? { CODEX_HOME: codexHomePath } : {}),
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-        shell: process.platform === "win32",
-      });
-      const output = readline.createInterface({ input: child.stdout });
 
       context = {
         session,
@@ -566,8 +579,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           planType: null,
           sparkEnabled: true,
         },
-        child,
-        output,
+        transport,
         pending: new Map(),
         pendingApprovals: new Map(),
         pendingUserInputs: new Map(),
@@ -576,9 +588,15 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       };
 
       this.sessions.set(threadId, context);
-      this.attachProcessListeners(context);
+      this.attachTransportListeners(context);
 
-      this.emitLifecycleEvent(context, "session/connecting", "Starting codex app-server");
+      this.emitLifecycleEvent(
+        context,
+        "session/connecting",
+        resolvedAppServerUrl
+          ? `Connecting to remote codex app-server at ${resolvedAppServerUrl}`
+          : "Starting codex app-server",
+      );
 
       await this.sendRequest(context, "initialize", buildCodexInitializeParams());
 
@@ -854,6 +872,14 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   }
 
   async readThread(threadId: ThreadId): Promise<CodexThreadSnapshot> {
+    const snapshot = await this.readThreadDetails(threadId);
+    return {
+      threadId: snapshot.threadId,
+      turns: snapshot.turns,
+    };
+  }
+
+  async readThreadDetails(threadId: ThreadId): Promise<CodexThreadDetailsSnapshot> {
     const context = this.requireSession(threadId);
     const providerThreadId = readResumeThreadId({
       threadId: context.session.threadId,
@@ -868,7 +894,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       threadId: providerThreadId,
       includeTurns: true,
     });
-    return this.parseThreadSnapshot("thread/read", response);
+    return this.parseThreadDetailsSnapshot("thread/read", response);
   }
 
   async rollbackThread(threadId: ThreadId, numTurns: number): Promise<CodexThreadSnapshot> {
@@ -987,11 +1013,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     context.pendingApprovals.clear();
     context.pendingUserInputs.clear();
 
-    context.output.close();
-
-    if (!context.child.killed) {
-      killChildTree(context.child);
-    }
+    context.transport.close();
 
     this.updateSession(context, {
       status: "closed",
@@ -1030,26 +1052,22 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     return context;
   }
 
-  private attachProcessListeners(context: CodexSessionContext): void {
-    context.output.on("line", (line) => {
-      this.handleStdoutLine(context, line);
+  private attachTransportListeners(context: CodexSessionContext): void {
+    context.transport.onMessage((message) => {
+      this.handleTransportMessage(context, message);
     });
 
-    context.child.stderr.on("data", (chunk: Buffer) => {
-      const raw = chunk.toString();
-      const lines = raw.split(/\r?\n/g);
-      for (const rawLine of lines) {
-        const classified = classifyCodexStderrLine(rawLine);
-        if (!classified) {
-          continue;
-        }
-
-        this.emitErrorEvent(context, "process/stderr", classified.message);
+    context.transport.onStderr((line) => {
+      const classified = classifyCodexStderrLine(line);
+      if (!classified) {
+        return;
       }
+
+      this.emitErrorEvent(context, "process/stderr", classified.message);
     });
 
-    context.child.on("error", (error) => {
-      const message = error.message || "codex app-server process errored.";
+    context.transport.onError((error) => {
+      const message = error.message || "codex app-server transport errored.";
       this.updateSession(context, {
         status: "error",
         lastError: message,
@@ -1057,23 +1075,23 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       this.emitErrorEvent(context, "process/error", message);
     });
 
-    context.child.on("exit", (code, signal) => {
+    context.transport.onClose((closeEvent) => {
       if (context.stopping) {
         return;
       }
 
-      const message = `codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"}).`;
+      const message = closeEvent.message;
       this.updateSession(context, {
         status: "closed",
         activeTurnId: undefined,
-        lastError: code === 0 ? context.session.lastError : message,
+        lastError: closeEvent.clean ? context.session.lastError : message,
       });
       this.emitLifecycleEvent(context, "session/exited", message);
       this.sessions.delete(context.session.threadId);
     });
   }
 
-  private handleStdoutLine(context: CodexSessionContext, line: string): void {
+  private handleTransportMessage(context: CodexSessionContext, line: string): void {
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);
@@ -1298,11 +1316,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
   private writeMessage(context: CodexSessionContext, message: unknown): void {
     const encoded = JSON.stringify(message);
-    if (!context.child.stdin.writable) {
-      throw new Error("Cannot write to codex app-server stdin.");
+    if (!context.transport.isWritable()) {
+      throw new Error("Cannot write to codex app-server transport.");
     }
 
-    context.child.stdin.write(`${encoded}\n`);
+    context.transport.send(encoded);
   }
 
   private emitLifecycleEvent(context: CodexSessionContext, method: string, message: string): void {
@@ -1366,6 +1384,17 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
   }
 
   private parseThreadSnapshot(method: string, response: unknown): CodexThreadSnapshot {
+    const snapshot = this.parseThreadDetailsSnapshot(method, response);
+    return {
+      threadId: snapshot.threadId,
+      turns: snapshot.turns,
+    };
+  }
+
+  private parseThreadDetailsSnapshot(
+    method: string,
+    response: unknown,
+  ): CodexThreadDetailsSnapshot {
     const responseRecord = this.readObject(response);
     const thread = this.readObject(responseRecord, "thread");
     const threadIdRaw =
@@ -1385,11 +1414,40 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         items,
       };
     });
+    const createdAtString = this.readString(thread, "createdAt");
+    const createdAtNumber = this.readNumber(thread, "createdAt");
+    const updatedAtString = this.readString(thread, "updatedAt");
+    const updatedAtNumber = this.readNumber(thread, "updatedAt");
+    const name = this.readString(thread, "name");
+    const cwd = this.readString(thread, "cwd");
+    const pathValue = this.readString(thread, "path");
 
-    return {
+    const snapshot: CodexThreadDetailsSnapshot = {
       threadId: threadIdRaw,
       turns,
     };
+
+    if (name) {
+      snapshot.name = name;
+    }
+    if (cwd) {
+      snapshot.cwd = cwd;
+    }
+    if (pathValue) {
+      snapshot.path = pathValue;
+    }
+    if (createdAtString) {
+      snapshot.createdAt = createdAtString;
+    } else if (createdAtNumber !== undefined) {
+      snapshot.createdAt = createdAtNumber;
+    }
+    if (updatedAtString) {
+      snapshot.updatedAt = updatedAtString;
+    } else if (updatedAtNumber !== undefined) {
+      snapshot.updatedAt = updatedAtNumber;
+    }
+
+    return snapshot;
   }
 
   private isServerRequest(value: unknown): value is JsonRpcRequest {
@@ -1485,6 +1543,15 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     return typeof candidate === "string" ? candidate : undefined;
   }
 
+  private readNumber(value: unknown, key: string): number | undefined {
+    if (!value || typeof value !== "object") {
+      return undefined;
+    }
+
+    const candidate = (value as Record<string, unknown>)[key];
+    return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined;
+  }
+
   private readBoolean(value: unknown, key: string): boolean | undefined {
     if (!value || typeof value !== "object") {
       return undefined;
@@ -1510,6 +1577,7 @@ function normalizeProviderThreadId(value: string | undefined): string | undefine
 function readCodexProviderOptions(input: CodexAppServerStartSessionInput): {
   readonly binaryPath?: string;
   readonly homePath?: string;
+  readonly appServerUrl?: string;
 } {
   const options = input.providerOptions?.codex;
   if (!options) {
@@ -1518,6 +1586,7 @@ function readCodexProviderOptions(input: CodexAppServerStartSessionInput): {
   return {
     ...(options.binaryPath ? { binaryPath: options.binaryPath } : {}),
     ...(options.homePath ? { homePath: options.homePath } : {}),
+    ...(options.appServerUrl ? { appServerUrl: options.appServerUrl } : {}),
   };
 }
 
@@ -1585,3 +1654,8 @@ function toTurnId(value: string | undefined): TurnId | undefined {
 function toProviderItemId(value: string | undefined): ProviderItemId | undefined {
   return brandIfNonEmpty(value, ProviderItemId.makeUnsafe);
 }
+
+
+
+
+

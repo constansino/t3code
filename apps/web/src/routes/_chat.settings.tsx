@@ -21,6 +21,7 @@ import { Input } from "../components/ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../components/ui/select";
 import { Switch } from "../components/ui/switch";
 import { SidebarInset } from "~/components/ui/sidebar";
+import CodexSourcesSettingsSection from "../components/CodexSourcesSettingsSection";
 
 const THEME_OPTIONS = [
   {
@@ -475,6 +476,8 @@ function SettingsRouteView() {
                 })}
               </div>
             </section>
+
+            <CodexSourcesSettingsSection />
 
             <section className="rounded-2xl border border-border bg-card p-5">
               <div className="mb-4">

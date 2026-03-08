@@ -22,6 +22,12 @@ import type {
 } from "./project";
 import type { ServerConfig } from "./server";
 import type {
+  CodexHistoryEntry,
+  CodexImportHistoryInput,
+  CodexImportHistoryResult,
+  CodexListHistoryInput,
+} from "./codexSource";
+import type {
   TerminalClearInput,
   TerminalCloseInput,
   TerminalEvent,
@@ -137,6 +143,8 @@ export interface NativeApi {
   server: {
     getConfig: () => Promise<ServerConfig>;
     upsertKeybinding: (input: ServerUpsertKeybindingInput) => Promise<ServerUpsertKeybindingResult>;
+    listCodexHistory: (input: CodexListHistoryInput) => Promise<CodexHistoryEntry[]>;
+    importCodexHistory: (input: CodexImportHistoryInput) => Promise<CodexImportHistoryResult>;
   };
   orchestration: {
     getSnapshot: () => Promise<OrchestrationReadModel>;

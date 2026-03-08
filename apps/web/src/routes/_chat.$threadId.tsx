@@ -1,11 +1,19 @@
 import { ThreadId } from "@t3tools/contracts";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Suspense, lazy, type ReactNode, useCallback, useEffect } from "react";
+import { parseCodexSourceThreadId } from "@t3tools/shared/codexSourceThread";
 
+import {
+  bindCodexSourceFolderLabel,
+  resolveConfiguredCodexSources,
+  updateAppSettings,
+  useAppSettings,
+} from "../appSettings";
 import ChatView from "../components/ChatView";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { parseDiffRouteSearch, stripDiffSearchParams } from "../diffRouteSearch";
 import { useMediaQuery } from "../hooks/useMediaQuery";
+import { readNativeApi } from "../nativeApi";
 import { useStore } from "../store";
 import { Sheet, SheetPopup } from "../components/ui/sheet";
 import { Sidebar, SidebarInset, SidebarProvider, SidebarRail } from "~/components/ui/sidebar";
@@ -15,6 +23,23 @@ const DIFF_INLINE_LAYOUT_MEDIA_QUERY = "(max-width: 1180px)";
 const DIFF_INLINE_SIDEBAR_WIDTH_STORAGE_KEY = "chat_diff_sidebar_width";
 const DIFF_INLINE_DEFAULT_WIDTH = "clamp(28rem,48vw,44rem)";
 const DIFF_INLINE_SIDEBAR_MIN_WIDTH = 26 * 16;
+const codexSourceThreadSyncTasks = new Map<string, Promise<void>>();
+
+function runCodexSourceThreadSyncTask(key: string, task: () => Promise<void>): Promise<void> {
+  const existingTask = codexSourceThreadSyncTasks.get(key);
+  if (existingTask) {
+    return existingTask;
+  }
+
+  const nextTask = task();
+  codexSourceThreadSyncTasks.set(key, nextTask);
+  void nextTask.finally(() => {
+    if (codexSourceThreadSyncTasks.get(key) === nextTask) {
+      codexSourceThreadSyncTasks.delete(key);
+    }
+  });
+  return nextTask;
+}
 
 const DiffPanelSheet = (props: {
   children: ReactNode;
@@ -133,11 +158,14 @@ const DiffPanelInlineSidebar = (props: {
 };
 
 function ChatThreadRouteView() {
+  const { settings } = useAppSettings();
   const threadsHydrated = useStore((store) => store.threadsHydrated);
   const navigate = useNavigate();
   const threadId = Route.useParams({
     select: (params) => ThreadId.makeUnsafe(params.threadId),
   });
+  const activeThread = useStore((store) => store.threads.find((thread) => thread.id === threadId) ?? null);
+  const syncServerReadModel = useStore((store) => store.syncServerReadModel);
   const search = Route.useSearch();
   const threadExists = useStore((store) => store.threads.some((thread) => thread.id === threadId));
   const draftThreadExists = useComposerDraftStore(
@@ -176,6 +204,53 @@ function ChatThreadRouteView() {
       return;
     }
   }, [navigate, routeThreadExists, threadsHydrated, threadId]);
+
+  useEffect(() => {
+    if (!threadsHydrated || !routeThreadExists || activeThread?.session?.status === "running") {
+      return;
+    }
+
+    const sourceThread = parseCodexSourceThreadId(threadId);
+    if (!sourceThread) {
+      return;
+    }
+
+    const source = resolveConfiguredCodexSources(settings).find(
+      (entry) => entry.id === sourceThread.sourceId,
+    );
+    const api = readNativeApi();
+    if (!source || !api) {
+      return;
+    }
+
+    void runCodexSourceThreadSyncTask(threadId, async () => {
+      try {
+        const result = await api.server.importCodexHistory({
+          source,
+          sessionIds: [sourceThread.sessionId],
+          syncContent: true,
+        });
+        if (result.sourceFolderLabel) {
+          updateAppSettings((currentSettings) => ({
+            codexSourceFolderLabels: bindCodexSourceFolderLabel(
+              currentSettings,
+              source.id,
+              result.sourceFolderLabel,
+            ),
+          }));
+        }
+        const snapshot = await api.orchestration.getSnapshot();
+        syncServerReadModel(snapshot);
+      } catch (error) {
+        console.warn("Failed to sync Codex source thread", {
+          threadId,
+          sourceId: source.id,
+          sessionId: sourceThread.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    });
+  }, [activeThread?.session?.status, routeThreadExists, settings, syncServerReadModel, threadId, threadsHydrated]);
 
   if (!threadsHydrated || !routeThreadExists) {
     return null;

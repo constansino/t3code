@@ -24,6 +24,7 @@ describe("ProviderSessionStartInput", () => {
         codex: {
           binaryPath: "/usr/local/bin/codex",
           homePath: "/tmp/.codex",
+          appServerUrl: "ws://127.0.0.1:14500",
         },
       },
     });
@@ -32,6 +33,7 @@ describe("ProviderSessionStartInput", () => {
     expect(parsed.modelOptions?.codex?.fastMode).toBe(true);
     expect(parsed.providerOptions?.codex?.binaryPath).toBe("/usr/local/bin/codex");
     expect(parsed.providerOptions?.codex?.homePath).toBe("/tmp/.codex");
+    expect(parsed.providerOptions?.codex?.appServerUrl).toBe("ws://127.0.0.1:14500");
   });
 
   it("rejects payloads without runtime mode", () => {

@@ -135,6 +135,80 @@ function createPendingUserInputHarness() {
   return { manager, context, requireSession, writeMessage, emitEvent };
 }
 
+function createRemoteTransportHarness() {
+  const messageListeners: Array<(message: string) => void> = [];
+  const closeListeners: Array<(event: { message: string; clean: boolean }) => void> = [];
+
+  const emitMessage = (payload: unknown) => {
+    const encoded = JSON.stringify(payload);
+    for (const listener of messageListeners) {
+      listener(encoded);
+    }
+  };
+
+  const transport = {
+    kind: "websocket" as const,
+    isWritable: vi.fn(() => true),
+    send: vi.fn((encoded: string) => {
+      const message = JSON.parse(encoded) as { id?: string | number; method?: string };
+      if (message.id === undefined) {
+        return;
+      }
+
+      switch (message.method) {
+        case "initialize":
+          emitMessage({ id: message.id, result: { capabilities: { experimentalApi: true } } });
+          break;
+        case "model/list":
+          emitMessage({ id: message.id, result: { models: [] } });
+          break;
+        case "account/read":
+          emitMessage({
+            id: message.id,
+            result: {
+              type: "chatgpt",
+              planType: "pro",
+            },
+          });
+          break;
+        case "thread/start":
+          emitMessage({
+            id: message.id,
+            result: {
+              thread: {
+                id: "provider-thread-1",
+              },
+            },
+          });
+          break;
+        default:
+          emitMessage({ id: message.id, result: {} });
+      }
+    }),
+    close: vi.fn(() => {
+      for (const listener of closeListeners) {
+        listener({
+          message: "remote codex app-server disconnected (code=1000).",
+          clean: true,
+        });
+      }
+    }),
+    onMessage: vi.fn((listener: (message: string) => void) => {
+      messageListeners.push(listener);
+    }),
+    onStderr: vi.fn(),
+    onError: vi.fn(),
+    onClose: vi.fn((listener: (event: { message: string; clean: boolean }) => void) => {
+      closeListeners.push(listener);
+    }),
+  };
+
+  return {
+    createTransport: vi.fn(async () => transport),
+    transport,
+  };
+}
+
 describe("classifyCodexStderrLine", () => {
   it("ignores empty lines", () => {
     expect(classifyCodexStderrLine("   ")).toBeNull();
@@ -368,6 +442,74 @@ describe("startSession", () => {
       versionCheck.mockRestore();
       manager.stopAll();
     }
+  });
+
+  it("connects to a remote Codex app-server when configured", async () => {
+    const { createTransport, transport } = createRemoteTransportHarness();
+    const manager = new CodexAppServerManager(undefined, {
+      appServerUrl: "ws://127.0.0.1:4500",
+      createTransport,
+    });
+    const events: Array<{ method: string; kind: string; message?: string }> = [];
+    manager.on("event", (event) => {
+      events.push({
+        method: event.method,
+        kind: event.kind,
+        ...(event.message ? { message: event.message } : {}),
+      });
+    });
+
+    const versionCheck = vi.spyOn(
+      manager as unknown as {
+        assertSupportedCodexCliVersion: (input: {
+          binaryPath: string;
+          cwd: string;
+          homePath?: string;
+        }) => void;
+      },
+      "assertSupportedCodexCliVersion",
+    );
+
+    try {
+      const session = await manager.startSession({
+        threadId: asThreadId("thread-remote"),
+        provider: "codex",
+        cwd: "/tmp/remote-workspace",
+        runtimeMode: "full-access",
+      });
+
+      expect(versionCheck).not.toHaveBeenCalled();
+      expect(createTransport).toHaveBeenCalledWith({
+        appServerUrl: "ws://127.0.0.1:4500",
+        binaryPath: "codex",
+        cwd: "/tmp/remote-workspace",
+      });
+      expect(session).toEqual(
+        expect.objectContaining({
+          status: "ready",
+          threadId: "thread-remote",
+          resumeCursor: { threadId: "provider-thread-1" },
+        }),
+      );
+      expect(events).toEqual(
+        expect.arrayContaining([
+          {
+            method: "session/connecting",
+            kind: "session",
+            message: "Connecting to remote codex app-server at ws://127.0.0.1:4500",
+          },
+          {
+            method: "session/ready",
+            kind: "session",
+            message: "Connected to thread provider-thread-1",
+          },
+        ]),
+      );
+    } finally {
+      manager.stopAll();
+    }
+
+    expect(transport.close).toHaveBeenCalledTimes(1);
   });
 });
 

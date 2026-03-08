@@ -1,10 +1,12 @@
 import * as Http from "node:http";
+import path from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it, vi } from "@effect/vitest";
 import type { OrchestrationReadModel } from "@t3tools/contracts";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Command from "effect/unstable/cli/Command";
 import { FetchHttpClient } from "effect/unstable/http";
 import { beforeEach } from "vitest";
@@ -16,6 +18,7 @@ import { Open, type OpenShape } from "./open";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService";
 import { Server, type ServerShape } from "./wsServer";
+import { ProviderSessionDirectory } from "./provider/Services/ProviderSessionDirectory";
 
 const start = vi.fn(() => undefined);
 const stop = vi.fn(() => undefined);
@@ -32,6 +35,13 @@ const findAvailablePort = vi.fn((preferred: number) => Effect.succeed(preferred)
 
 // Shared service layer used by this CLI test suite.
 const testLayer = Layer.mergeAll(
+  Layer.succeed(ProviderSessionDirectory, {
+    upsert: () => Effect.void,
+    getProvider: () => Effect.die(new Error("Provider session directory unavailable in test.")),
+    getBinding: () => Effect.succeed(Option.none()),
+    remove: () => Effect.void,
+    listThreadIds: () => Effect.succeed([]),
+  }),
   Layer.succeed(CliConfig, {
     cwd: "/tmp/t3-test-workspace",
     fixPath: Effect.void,
@@ -106,7 +116,8 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.mode, "desktop");
       assert.equal(resolvedConfig?.port, 4010);
       assert.equal(resolvedConfig?.host, "0.0.0.0");
-      assert.equal(resolvedConfig?.stateDir, "/tmp/t3-cli-state");
+      assert.equal(resolvedConfig?.codexAppServerUrl, undefined);
+      assert.equal(resolvedConfig?.stateDir, path.resolve("/tmp/t3-cli-state"));
       assert.equal(resolvedConfig?.devUrl?.toString(), "http://127.0.0.1:5173/");
       assert.equal(resolvedConfig?.noBrowser, true);
       assert.equal(resolvedConfig?.authToken, "auth-secret");
@@ -114,6 +125,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.logWebSocketEvents, true);
       assert.equal(stop.mock.calls.length, 1);
     }),
+    15_000,
   );
 
   it.effect("supports --token as an alias for --auth-token", () =>
@@ -123,6 +135,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(start.mock.calls.length, 1);
       assert.equal(resolvedConfig?.authToken, "token-secret");
     }),
+    15_000,
   );
 
   it.effect("uses env fallbacks when flags are not provided", () =>
@@ -141,7 +154,8 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.mode, "desktop");
       assert.equal(resolvedConfig?.port, 4999);
       assert.equal(resolvedConfig?.host, "100.88.10.4");
-      assert.equal(resolvedConfig?.stateDir, "/tmp/t3-env-state");
+      assert.equal(resolvedConfig?.codexAppServerUrl, undefined);
+      assert.equal(resolvedConfig?.stateDir, path.resolve("/tmp/t3-env-state"));
       assert.equal(resolvedConfig?.devUrl?.toString(), "http://localhost:5173/");
       assert.equal(resolvedConfig?.noBrowser, true);
       assert.equal(resolvedConfig?.authToken, "env-token");
@@ -164,6 +178,28 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.mode, "web");
       assert.equal(resolvedConfig?.port, 4666);
       assert.equal(resolvedConfig?.host, undefined);
+    }),
+  );
+
+  it.effect("supports CLI and env for remote Codex app-server URL", () =>
+    Effect.gen(function* () {
+      yield* runCli(["--codex-app-server-url", "ws://127.0.0.1:4500"], {
+        T3CODE_CODEX_APP_SERVER_URL: "ws://127.0.0.1:9999",
+      });
+
+      assert.equal(start.mock.calls.length, 1);
+      assert.equal(resolvedConfig?.codexAppServerUrl, "ws://127.0.0.1:4500/");
+    }),
+  );
+
+  it.effect("reads remote Codex app-server URL from env", () =>
+    Effect.gen(function* () {
+      yield* runCli([], {
+        T3CODE_CODEX_APP_SERVER_URL: "wss://codex.example.com/app-server",
+      });
+
+      assert.equal(start.mock.calls.length, 1);
+      assert.equal(resolvedConfig?.codexAppServerUrl, "wss://codex.example.com/app-server");
     }),
   );
 

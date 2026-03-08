@@ -19,6 +19,7 @@ export interface ServerConfigShape {
   readonly mode: RuntimeMode;
   readonly port: number;
   readonly host: string | undefined;
+  readonly codexAppServerUrl: string | undefined;
   readonly cwd: string;
   readonly keybindingsConfigPath: string;
   readonly stateDir: string;
@@ -49,6 +50,7 @@ export class ServerConfig extends ServiceMap.Service<ServerConfig, ServerConfigS
           logWebSocketEvents: false,
           port: 0,
           host: undefined,
+          codexAppServerUrl: undefined,
           authToken: undefined,
           keybindingsConfigPath: path.join(statedir, "keybindings.json"),
           staticDir: undefined,
